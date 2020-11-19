@@ -1,304 +1,455 @@
-/****** 
-RATS Query
-Created By: Emma Dixon 
-Modified By: Sara Esquibel
-Created Date:  <MM/DD/YYYY>                                                                                                                                                          
-Modified Date: 01/18/2019
-Project: Neighborhood Rat Reduction Program
-Tables Used:	ParksGIS.DPR.PROPERTY_EVW
-				ParksGIS.DPR.PLAYGROUND_EVW
-				ParksGIS.DPR.ZONE_EVW
-				ParksGIS.DPR.GREENSTREET
-				EAMPROD.dbo.r5objects
-				EAMPROD.dbo.R5Events
-				EAMPROD.dbo.R5ADDETAILS
-				EAMPROD.dbo.R5Bookedhours
-				DWH.dbo.dailytasks
-				DWH.dbo.tbl_SupervisorInspections_FeatureFindings
-				DWH.dbo.tbl_SupervisorInspections_InspectionResults
-				DWH.dbo.tbl_PIP_InspectionMain
-				DWH.dbo.tbl_PIP_ConditionsHazards
-Description: <purpose of query, databases used (and descriptions if needed), what is output, why modified (if modified), etc.> 
-******/
+/***********************************************************************************************************************
+ Created By: Emma Dixon, emma.dixon@parks.nyc.gov, Innovation & Performance Management         											   
+ Modified By: Dan Gallagher, daniel.gallagher@parks.nyc.gov, Innovation & Performance Management  																						   			          
+ Created Date:  04/01/2018																							   
+ Modified Date: 08/01/2019																							   
+											       																	   
+ Project: Neighborhood Rat Reduction Program	
+ 																							   
+ Tables Used: dwh.dbo.tbl_nrr_sites																							   
+ 			  [dataparks].dwh.dbo.tbl_supervisorinspections_inspectionresults																								   
+ 			  [dataparks].dwh.dbo.tbl_supervisorinspections_featurefindings
+			  [dataparks].dwh.dbo.tbl_pip_conditionshazards
+			  [dataparks].dwh.dbo.tbl_pip_inspectionmain
+			  [dataparks].eamprod.dbo.r5events
+			  [dataparks].eamprod.dbo.r5bookedhours
+			  [dataparks].eamprod.dbo.r5addetails
+			  [dataparks].eamprod.dbo.r5eventobjects
+			  [dataparks].dwh.dbo.tbl_dailytasks
+			  				
+			  																				   
+ Description: Create a stored procedure that produces the weekly Rats! report. This report brings together data from
+	          daily tasks, AMPS, supervisor inspections and PIP. 									   
+																													   												
+***********************************************************************************************************************/
+
+use [reportdb]
+go
+
+set ansi_nulls on
+go
+
+set quoted_identifier on
+go
+
+--drop procedure dbo.sp_rpt_rats
+create or alter procedure rpt.sp_rpt_rats @startdate date,
+										  @enddate date as
+
+/*declare @startdate date = '2019-07-07',
+		@enddate date = '2019-07-13';*/
+
+--Create the table that holds the NRR Site information
+declare @nrrsites table(gispropnum nvarchar(30),
+						omppropid nvarchar(30), 
+						district nvarchar(15),
+						borough nvarchar(1),
+						site_name nvarchar(128),
+					    gisobjid bigint, 
+						nrr_name nvarchar(128) ,
+						sla nvarchar(80));
+
+insert into @nrrsites(gispropnum,
+					  omppropid, 
+					  district,
+					  borough,
+					  site_name,
+					  gisobjid,
+					  nrr_name,
+					  sla)	
+	select gispropnum,
+		   omppropid, 
+		   district,
+		   left(district, 1) as borough, 
+		   site_name,
+		   gisobjid, 
+		   nrr_name,
+		   sla
+   from reportdb.rpt.tbl_nrr_sites;
 
 
-USE [SYSTEMDB]
-GO
+--Create the table that holds the AMPS_Ins data
+declare @amps_ins table(omppropid nvarchar(30), 
+						nsupervisor_inspections int,
+						last_supervisorInspection date,
+						nsupervisor_inspections_rodents int,
+						nsupervisor_inspections_burrows int);
 
-SET ANSI_NULLS ON
-GO
+insert into @amps_ins(omppropid, nsupervisor_inspections, last_supervisorInspection, nsupervisor_inspections_rodents, nsupervisor_inspections_burrows)
+	select omppropid,
+		   count(distinct(inspection_date)) as nsupervisor_inspections,
+		   --max(inspection_date) as last_supervisorInspection,
+		   max(last_supervisorinspection) as last_supervisorinspection,
+		   sum(rodent) as nsupervisor_inspections_rodents,
+		   sum(nsupervisor_inspections_burrows) as nsupervisor_inspections_burrows
+	from (select r.district,
+				 l.omppropid,
+				 cast(r.inspection_date as date) as inspection_date,
+				 r3.last_supervisorinspection,
+				 r.date_started,
+				 r.date_completed,
+				 r.overall_rating,
+				 r.cleanliness_rating,
+				 r2.feature_category,
+				 r2.feature,
+				 r2.results,
+				 r2.findings,
+				 case when lower(r2.findings) like '%rodent%' then cast(1 as int) 
+			  		  else cast(0 as int)
+				 end as rodent,
+				 r2.[action],
+				 --,isnumeric(comments) as is_numeric
+				 case when isnumeric(substring(r2.comments, dwh.dbo.fn_bracket_num_st(r2.comments) + 1, dwh.dbo.fn_bracket_num_len(r2.comments))) = 1 then
+			   			   cast(substring(r2.comments, dwh.dbo.fn_bracket_num_st(r2.comments) + 1, dwh.dbo.fn_bracket_num_len(r2.comments)) as int)
+			   		  else cast(0 as int)
+				 end as nsupervisor_inspections_burrows
+	  from @nrrsites as l
+	  left join
+		   (select *
+			from [dataparks].dwh.dbo.tbl_supervisorinspections_inspectionresults
+			where cast(inspection_date as date) between @startdate and @enddate and
+				  lower(inspection_status) = 'completed')  as r
+	  on l.omppropid = r.omppropid
+	  left join 
+		   (select *
+			from [dataparks].dwh.dbo.tbl_supervisorinspections_featurefindings
+			where lower(feature) = 'litter') as r2
+	  on r.inspection_id = r2.inspection_id
+	  left join
+		   (select omppropid,
+				   max(cast(inspection_date as date)) as last_supervisorinspection
+			from [dataparks].dwh.dbo.tbl_supervisorinspections_inspectionresults
+			where lower(inspection_status) = 'completed'
+			group by omppropid)  as r3
+	  on l.omppropid = r3.omppropid) t
+	  group by omppropid
 
-SET QUOTED_IDENTIFIER ON
-GO
+--Create the table that holds the AMPS_Ins data
+declare @pip table(omppropid nvarchar(30), 
+				   npip_rodents int,
+				   npip_inspections int,
+				   last_pipinspection date);
 
+insert into @pip(omppropid, npip_rodents, npip_inspections, last_pipinspection)
+	select l.omppropid,
+		   sum(r.burrows) as npip_rodents,
+		   count(distinct r.inspection_id) as npip_inspections,
+		   max(r2.last_pipinspection) as last_pipinspection
+	from @nrrsites as l
+	left join
+		 (select [prop id] as omppropid,
+				 case when lower(probhaz) = 'rodent holes' and isnumeric(number)= 1 then cast(number as int)
+					  when lower(probhaz) = 'rodent holes' and number='10+' then cast(10 as int)
+					  else cast(0 as int)
+				 end as burrows,
+				 [inspection id] as inspection_id,
+				 cast([Date] as date) as inspection_date
+		   from [dataparks].dwh.dbo.tbl_pip_conditionshazards
+		   where cast([date] as date) between @startdate and @enddate and
+				 lower(inspectiontype) = 'pip') as r
+	on l.omppropid = r.omppropid
+	left join
+		 (select [prop id] as omppropid,
+				 max(cast([date] as date)) as last_pipinspection
+		  from [dataparks].dwh.dbo.tbl_pip_inspectionmain
+		  group by [prop id]) as r2
+	on l.omppropid = r2.omppropid
+	group by l.omppropid
 
-CREATE PROCEDURE [dbo].[sp_rpt_RATS]
-	 @startdate date
-	,@enddate date as
+declare @amps_wos table(evt_code nvarchar(30), 
+						ndays_baited int,
+						ndryice_application int,
+						nhours_baiting decimal(10,2));
 
+insert into @amps_wos(evt_code, 
+					  ndays_baited,
+					  ndryice_application,
+					  nhours_baiting)
+	select l.evt_code,
+		   --count(distinct cast(r.boo_date as date)) as ndays_baited,
+		   sum(ndays_baited) as ndays_baited,
+		   sum(isnull(r2.ice_app, cast(0 as int))) as ndryice_application,
+		   sum(nhours_baiting) as nhours_baiting
+		   --cast(sum(r.boo_hours) as decimal(10,2)) as nhours_baiting
+	from (select *
+		  from [dataparks].eamprod.dbo.r5events
+		   /*Only include work orders that are of standard work order type = "pest" and the description is like " rat " or " rodent " Include
+			 all comibinations of spaces in the words.*/
+		   where lower(evt_standwork) = 'pest' and
+				 (lower(evt_desc) like '% rat %' or lower(evt_desc) like '% rodent %'  or
+				  lower(evt_desc) like '% rats %' or lower(evt_desc) like '% rodents %' or 
+				  lower(evt_desc) like 'rats %' or lower(evt_desc) like 'rodents %' or 
+				  lower(evt_desc) like '% rats' or lower(evt_desc) like '% rodents' or
+				  lower(evt_desc) like 'rat %' or lower(evt_desc) like 'rodent %' or 
+				  lower(evt_desc) like '% rat' or lower(evt_desc) like '% rodent' or
+				  lower(evt_desc) like '%rodent%')) as l
+	inner join
+		  (select boo_event,
+				  count(distinct cast(boo_date as date)) as ndays_baited,
+				  sum(boo_hours) as nhours_baiting
+		   from [dataparks].eamprod.dbo.r5bookedhours
+		   /*Apply the date filter to the booked hours table.*/
+		   where boo_date between @startdate and @enddate and
+			     boo_act = 10
+		   group by boo_event) as r
+	on l.evt_code = r.boo_event
+	left join
+		(select add_code,
+				/*If the comments contain "rat ice" or "dry ice" then count them a 1 application.*/
+				case when lower(convert(nvarchar(max), add_text)) like '%rat ice%' then cast(1 as int)
+					 when lower(convert(nvarchar(max), add_text))  like '%dry ice%' then cast(1 as int)
+					 /*If there are no comments then count as 0 applications.*/
+					 --when lower(cast(add_text as nvarchar)) is null then cast(0 as int)
+					 /*Otherwise count as 0 applications*/
+					 else cast(0 as int)
+				end as ice_app
+		 from [dataparks].eamprod.dbo.r5addetails
+		 /*Filter the comments aka additional details to the selected dates and events aka work orders.*/
+		 where add_created between @startdate and @enddate and
+			   add_entity = 'EVNT') as r2
+	on l.evt_code = r2.add_code
+	group by l.evt_code--, r.boo_date
 
-SELECT 
-CASE WHEN left(department,1)='B' THEN 'Brooklyn'
-	WHEN left(department,1)='M' THEN 'Manhattan'
-	WHEN left(department,1)='X' THEN 'Bronx'
-	ELSE 'ERR' END as Borough,
-[NRR Zone],
-department as district,
-gispropnum,
-props.omppropid,
-signname,
-coalesce(sla,'') as SLA,
-sum(CASE WHEN Work_Type='Cleaning' THEN Visits ELSE 0 END) as [Cleaning Visits],
-sum(CASE WHEN Work_Type='Cleaning' THEN Days_Visited ELSE 0 END) as [Cleaning Visit Days],
---avg(CASE WHEN Work_Type='Cleaning' THEN Crew_Size ELSE 0.0 END) as [Average Cleaning Crew Size], --this isn't working for some reason
-round(sum(CASE WHEN Work_Type='Cleaning' THEN Work_Hours ELSE 0 END),1) as [Hours of Cleaning],
-sum(CASE WHEN Work_Type='Packer' THEN Visits ELSE 0 END) as [Packer Visits],
-sum(CASE WHEN Work_Type='Packer' THEN Days_Visited ELSE 0 END) as [Packer Visit Days],
-coalesce(sum(Overflowing_Cans),0) as Overflowing_Cans,
-coalesce(sum(Food_Waste),0) as Food_Waste,
-last_DT.last_workentry as [Last Daily Tasks Entry],
---sum(CASE WHEN Work_Type='Packer' THEN Work_Hours ELSE 0 END) as Packer_Hours,
-coalesce(supervisor_inspections,0) as [Supervisor Inspections],
-coalesce(rodent_sightings,0) as [Supervisor Inspections with Rodent Conditions],
-coalesce(num_burrows,0) as [Burrows Counted by Supervisors],
-last_SI.last_supervisorinspection as [Last Supervisor Inspection],
-coalesce(PIP_inspections,0) as [PIP Inspections],
-coalesce(Burrows,0) as [Burrows Counted by PIP],
-last_PIP.last_pipinspection as [Last PIP Inspection],
-coalesce(Days_Baited,0) as [Days Baited],
-coalesce(Baiting_Hours,0) as [Baiting Work Hours],
-coalesce(rat_ice_applications,0) as [Dry Ice Applications]
-FROM
-( -- Query 1 - generates list of properties to include, including all subproperties
-SELECT a.*,
-b.sla FROM
-(
-SELECT gispropnum,
-omppropid,
-signname,
-department,
-CASE WHEN left(department,1)='B' THEN 'Brooklyn Bed Stuy and Bushwick'
-	WHEN left(department,1)='X' THEN 'Bronx Grand Concourse'
-	WHEN department IN ('M-01','M-03') THEN 'Manhattan East Village and Chinatown'
-	WHEN department IN ('M-07','M-14') THEN 'Upper West Side'
-	ELSE 'ERR' END AS 'NRR Zone'
-FROM
-					(SELECT OMPPROPID,GISPROPNUM, SIGNNAME, DEPARTMENT
-						FROM ParksGIS.DPR.PROPERTY_EVW
-						UNION 
-						SELECT OMPPROPID,GISPROPNUM, SIGNNAME, DEPARTMENT 
-						FROM ParksGIS.DPR.PLAYGROUND_EVW
-						UNION 
-						SELECT OMPPROPID,GISPROPNUM, DESCRIPTION, DEPARTMENT
-						FROM ParksGIS.DPR.ZONE_EVW
-						UNION
-						SELECT OMPPROPID,GISPROPNUM,DESCRIPTION,DEPARTMENT
-						FROM ParksGIS.DPR.GREENSTREET
-						) as GIS
-WHERE gispropnum IN ('B351',	'B555',	'M015-01',	'M048',	'M105-06',	'M144',	'MZ436',	'X008',	'X011',	'X030',	'X030-01',	'X034',	'X047',	'X148B1',	'X148C',	'X148C4',	'X148C6',	'X148D',	'X148E1',	'X148F5',	'X153',	'X225',	'X226',	'X236',	'X254',	'X348',	'B016',	'B016-01',	'B016-02',	'B088',	'B088-02',	'B088-03',	'B139',	'B140',	'B217',	'B237',	'B262',	'B263',	'B266',	'B269',	'B298',	'B317',	'B322',	'B323',	'B334',	'B348',	'B359',	'M015',	'M033',	'M053',	'M065',	'M067',	'M071-04',	'M071-08',	'M071-13',	'M071-16',	'M071-ZN07',	'M071-ZN09',	'M082',	'M088',	'M088-01',	'M088-03',	'M105',	'M105-01',	'M105-02',	'M105-04',	'M105-08',	'M113',	'M116',	'M122',	'M123',	'M124',	'M144-01',	'M144-ZN01',	'M144-ZN02',	'M144-ZN03',	'M144-ZN04',	'M144-ZN05',	'M144-ZN06',	'M165',	'M188',	'M188A',	'M195',	'M196',	'M200',	'M201',	'M220',	'M224',	'M228',	'M229',	'M235',	'M238',	'M241',	'M246',	'M255',	'M259',	'M270',	'M321',	'X001-ZN02',	'X001A-01',	'X006',	'X008-01',	'X008-03',	'X011-ZN01',	'X011-ZN02',	'X017',	'X017-01',	'X017-02',	'X028',	'X030-02',	'X030-99',	'X030-ZN01',	'X030-ZN02',	'X032',	'X034-01',	'X034-06',	'X034-ZN01',	'X034-ZN02',	'X037',	'X042',	'X047-01',	'X047-ZN01',	'X047-ZN02',	'X068',	'X071',	'X085',	'X102',	'X108',	'X114',	'X129',	'X148C5',	'X148C7',	'X148D1',	'X148E',	'X153-01',	'X168',	'X174',	'X219',	'X244',	'X252',	'X257',	'X258',	'X263',	'X274',	'X280',	'X289',	'X291',	'X292',	'X300',	'X302',	'X348-01',	'X348-02',	'B006',	'B023',	'B037',	'B041',	'B045',	'B340',	'B395',	'B429',	'B430',	'M002',	'M004',	'M016',	'M080',	'M247',	'M254',	'X008-ZN01',	'X008-ZN02',	'X008-ZN03',	'X018',	'X030-ZN03',	'X036',	'X058',	'X059',	'X061',	'X069',	'X081',	'X115',	'X153-02',	'X271',	'X001A',	'X057',	'X067',	'X105',	'X130',	'X148B2',	'X148C1',	'X148C3',	'X269',	'XZ475')
-OR OMPPROPID IN ('B351',	'B555',	'M015-01',	'M048',	'M105-06',	'M144',	'MZ436',	'X008',	'X011',	'X030',	'X030-01',	'X034',	'X047',	'X148B1',	'X148C',	'X148C4',	'X148C6',	'X148D',	'X148E1',	'X148F5',	'X153',	'X225',	'X226',	'X236',	'X254',	'X348',	'B016',	'B016-01',	'B016-02',	'B088',	'B088-02',	'B088-03',	'B139',	'B140',	'B217',	'B237',	'B262',	'B263',	'B266',	'B269',	'B298',	'B317',	'B322',	'B323',	'B334',	'B348',	'B359',	'M015',	'M033',	'M053',	'M065',	'M067',	'M071-04',	'M071-08',	'M071-13',	'M071-16',	'M071-ZN07',	'M071-ZN09',	'M082',	'M088',	'M088-01',	'M088-03',	'M105',	'M105-01',	'M105-02',	'M105-04',	'M105-08',	'M113',	'M116',	'M122',	'M123',	'M124',	'M144-01',	'M144-ZN01',	'M144-ZN02',	'M144-ZN03',	'M144-ZN04',	'M144-ZN05',	'M144-ZN06',	'M165',	'M188',	'M188A',	'M195',	'M196',	'M200',	'M201',	'M220',	'M224',	'M228',	'M229',	'M235',	'M238',	'M241',	'M246',	'M255',	'M259',	'M270',	'M321',	'X001-ZN02',	'X001A-01',	'X006',	'X008-01',	'X008-03',	'X011-ZN01',	'X011-ZN02',	'X017',	'X017-01',	'X017-02',	'X028',	'X030-02',	'X030-99',	'X030-ZN01',	'X030-ZN02',	'X032',	'X034-01',	'X034-06',	'X034-ZN01',	'X034-ZN02',	'X037',	'X042',	'X047-01',	'X047-ZN01',	'X047-ZN02',	'X068',	'X071',	'X085',	'X102',	'X108',	'X114',	'X129',	'X148C5',	'X148C7',	'X148D1',	'X148E',	'X153-01',	'X168',	'X174',	'X219',	'X244',	'X252',	'X257',	'X258',	'X263',	'X274',	'X280',	'X289',	'X291',	'X292',	'X300',	'X302',	'X348-01',	'X348-02',	'B006',	'B023',	'B037',	'B041',	'B045',	'B340',	'B395',	'B429',	'B430',	'M002',	'M004',	'M016',	'M080',	'M247',	'M254',	'X008-ZN01',	'X008-ZN02',	'X008-ZN03',	'X018',	'X030-ZN03',	'X036',	'X058',	'X059',	'X061',	'X069',	'X081',	'X115',	'X153-02',	'X271',	'X001A',	'X057',	'X067',	'X105',	'X130',	'X148B2',	'X148C1',	'X148C3',	'X269',	'XZ475')
-) a
-INNER JOIN
-(SELECT DISTINCT obj_code as property_number, obj_udfchar02 as sla
-FROM eamprod.dbo.r5objects
-WHERE obj_notused = '-'
-AND obj_status <> 'D') as b --this exists to eliminate properties that appear in the above but not in AMPS; if they are not in AMPS they do not exist for the purposes of rat tracking
-on a.OMPPROPID=b.property_number COLLATE Latin1_general_BIN
-) 
-as props
+declare @amps_rollup table(omppropid nvarchar(30), 
+						   ndays_baited int,
+						   ndryice_application int,
+						   nhours_baiting decimal(10,2));
 
-LEFT JOIN
+/*In order to capture work orders that are not directly booked to NRR Sites (ex: access points) join to event object,
+  which tracks the hierarchy.*/
+insert into @amps_rollup(omppropid, 
+						 ndays_baited,
+						 ndryice_application,
+						 nhours_baiting)
+	select omppropid,
+		   max(ndays_baited) as ndays_baited,
+		   sum(ndryice_application) as ndryice_application,
+		   sum(nhours_baiting) as nhours_baiting
+	from (select l.evt_code,
+				 r2.omppropid,
+				 l.ndays_baited,
+				 l.ndryice_application,
+				 l.nhours_baiting,
+				 r.eob_level,
+				 min(r.eob_level) over(partition by l.evt_code order by l.evt_code) as min_eob_level
+		  from @amps_wos as l
+		  left join
+			   [dataparks].eamprod.dbo.r5eventobjects as r
+		  on l.evt_code = r.eob_event collate SQL_Latin1_General_CP1_CI_AS
+		  right join
+			   @nrrsites as r2
+		  on r.eob_object = r2.omppropid collate latin1_general_bin) as t
+	where eob_level = min_eob_level
+	group by omppropid
 
-( -- Query 3 contains Supervisor Inspection information
+declare @dailytasks table(omppropid nvarchar(30),
+						  ncleaning_visits int,
+						  ncleaning_days_visits int,
+						  ncleaning_hours decimal(10,2),
+						  npacker_visits int,
+						  npacker_days_visits int,
+						  overflowing_cans int,
+						  food_waste int,
+						  last_dailytaskentry date);
 
-  SELECT omppropid
-	    ,count(distinct(inspection_date)) as supervisor_inspections
-		,sum(rodent) as rodent_sightings
-		,sum(CASE WHEN rodent = 1 THEN
-				  CASE WHEN is_numeric = 1 THEN cast(comments as float) ELSE 0 END -- casting as float prevents error if decimal value is entered
-				  ELSE 0 END) as num_burrows
-  FROM
-  (
-  SELECT district
-		,omppropid
-		,inspection_date
-		,date_started
-		,date_completed
-		,overall_rating
-		,cleanliness_rating
-		,feature_category
-		,feature
-		,results
-		,findings
-		,CASE WHEN lower(Findings) LIKE '%rodent%' THEN 1 ELSE 0 END AS rodent
-		,r.[action]
-		,comments
-		,isnumeric(comments) as is_numeric
-  FROM [DWH].[dbo].[tbl_supervisorinspections_inspectionresults] l
-		LEFT JOIN [DWH].[dbo].[tbl_SupervisorInspections_FeatureFindings] r
-		on l.inspection_id = r.inspection_id
-  WHERE l.inspection_status = 'Completed'
-		and feature = 'Litter'
-		and cast(inspection_date as date) BETWEEN @startdate and @enddate
-  ) a
+insert into @dailytasks(omppropid, ncleaning_visits, ncleaning_days_visits, ncleaning_hours, npacker_visits, npacker_days_visits, overflowing_cans, food_waste, last_dailytaskentry)
+	select omppropid,
+		   sum(nvisits - npacker_visits) as ncleaning_visits,
+		   count(distinct ncleaning_dates) as ncleaning_days_visits,
+		   sum((ncrew * nhours) - npacker_hours) as ncleaning_hours,
+		   sum(npacker_visits) as npacker_visits,
+		   count(distinct npacker_dates) as npacker_days_visits,
+		   sum(overflowing_cans) as overflowing_cans,
+		   sum(food_waste) as food_waste,
+		   last_dailytaskentry
+	from (select l.omppropid,
+				 r.date_worked,
+				 --max(r.date_worked) over(partition by r.omppropid order by r.omppropid) as last_dailytaskentry,
+				 r2.last_dailytaskentry,
+				 case when lower(route_name) not like '%packer%' then r.nhours * r.ncrew
+					  else cast(0 as decimal(10,2))
+				 end as ncleaning_hours,
+				 case when lower(r.route_name) like '%packer%' then r.nhours * r.ncrew
+					  else cast(0 as decimal(10,2))
+				 end as npacker_hours,
+				 case when lower(r.route_name) not like '%packer%' then cast(1 as int)
+					  else cast(0 as int)
+				 end as ncleaning_visits,
+				 case when lower(r.route_name) like '%packer%' then cast(1 as int)
+					  else cast(0 as int)
+				 end as npacker_visits,
+				 case when lower(r.notes) like '%overflow%' then cast(1 as int) 
+					  else cast(0 as int)
+				 end as overflowing_cans,
+				 case when lower(r.notes) like '%food%' then cast(1 as int) 
+					  else cast(0 as int)
+				 end as food_waste,
+				 case when lower(r.route_name) like '%packer%' then cast(null as date)
+					  else date_worked
+				 end as ncleaning_dates,
+				 case when lower(r.route_name) like '%packer%' then r.date_worked
+					  else cast(null as date)
+				 end as npacker_dates,
+				 cast(1 as int) as nvisits,
+				 r.gisobjid,
+				 r.nhours,
+				 r.ncrew
+		  from @nrrsites as l
+		  left join
+			   (select *
+			    from [dataparks].dwh.dbo.tbl_dailytasks
+				where date_worked between @startdate and @enddate and
+					  lower(activity) = 'work') as r
+		  on l.gisobjid = r.gisobjid
+		  left join	
+			   (select gisobjid, 
+					   max(date_worked) as last_dailytaskentry
+			    from [dataparks].dwh.dbo.tbl_dailytasks
+				where lower(activity) = 'work'
+				group by gisobjid)	as r2	
+		  on l.gisobjid = r2.gisobjid) as t 
+	group by omppropid, last_dailytaskentry
 
---WHERE omppropid IN ('B351',	'B555',	'M015-01',	'M048',	'M105-06',	'M144',	'MZ436',	'X008',	'X011',	'X030',	'X030-01',	'X034',	'X047',	'X148B1',	'X148C',	'X148C4',	'X148C6',	'X148D',	'X148E1',	'X148F5',	'X153',	'X225',	'X226',	'X236',	'X237',	'X254',	'X348',	'B016',	'B016-01',	'B016-02',	'B088',	'B088-02',	'B088-03',	'B139',	'B140',	'B217',	'B237',	'B262',	'B263',	'B266',	'B269',	'B298',	'B317',	'B322',	'B323',	'B334',	'B348',	'B359',	'M015',	'M033',	'M053',	'M065',	'M067',	'M071-04',	'M071-08',	'M071-13',	'M071-16',	'M071-ZN07',	'M071-ZN09',	'M082',	'M088',	'M088-01',	'M088-03',	'M105',	'M105-01',	'M105-02',	'M105-04',	'M105-08',	'M113',	'M116',	'M122',	'M123',	'M124',	'M144-01',	'M144-ZN01',	'M144-ZN02',	'M144-ZN03',	'M144-ZN04',	'M144-ZN05',	'M144-ZN06',	'M165',	'M188',	'M188A',	'M195',	'M196',	'M200',	'M201',	'M220',	'M224',	'M228',	'M229',	'M235',	'M238',	'M241',	'M246',	'M255',	'M259',	'M270',	'M321',	'X001-ZN02',	'X001A-01',	'X006',	'X008-01',	'X008-03',	'X011-ZN01',	'X011-ZN02',	'X017',	'X017-01',	'X017-02',	'X028',	'X030-02',	'X030-99',	'X030-ZN01',	'X030-ZN02',	'X032',	'X034-01',	'X034-06',	'X034-ZN01',	'X034-ZN02',	'X037',	'X042',	'X047-01',	'X047-ZN01',	'X047-ZN02',	'X068',	'X071',	'X085',	'X102',	'X108',	'X114',	'X129',	'X148C5',	'X148C7',	'X148D1',	'X148E',	'X153-01',	'X168',	'X174',	'X219',	'X244',	'X252',	'X257',	'X258',	'X263',	'X274',	'X280',	'X289',	'X291',	'X292',	'X300',	'X302',	'X348-01',	'X348-02',	'B006',	'B023',	'B037',	'B041',	'B045',	'B340',	'B395',	'B429',	'B430',	'M002',	'M004',	'M016',	'M080',	'M247',	'M254',	'X008-ZN01',	'X008-ZN02',	'X008-ZN03',	'X018',	'X030-ZN03',	'X036',	'X058',	'X059',	'X061',	'X069',	'X081',	'X115',	'X153-02',	'X271',	'X001A',	'X057',	'X067',	'X105',	'X130',	'X148B2',	'X148C1',	'X148C3',	'X269',	'XZ475')
-group by omppropid 
+declare @cube table(gispropnum nvarchar(30),
+					omppropid nvarchar(30), 
+					ncleaning_visits int,
+					ncleaning_days_visits int,
+					ncleaning_hours decimal(10,2),
+					npacker_visits int,
+					npacker_days_visits int,
+					--overflowing_cans int,
+					--food_waste int,
+					last_dailytaskentry date,
+					nsupervisor_inspections int,
+					nsupervisor_inspections_rodents int,
+					nsupervisor_inspections_burrows int,
+					last_supervisorInspection date,
+					npip_inspections int,
+					npip_rodents int,
+				    last_pipinspection date,
+					ndays_baited int,
+					nhours_baiting decimal(10,2),
+					ndryice_application int,
+					gispropnum_count int)
 
-) as SI
+insert into @cube(gispropnum,
+				  omppropid, 
+				  ncleaning_visits,
+				  ncleaning_days_visits,
+				  ncleaning_hours,
+				  npacker_visits,
+				  npacker_days_visits,
+				  --overflowing_cans int,
+				  --food_waste int,
+				  last_dailytaskentry,
+				  nsupervisor_inspections,
+				  nsupervisor_inspections_rodents,
+				  nsupervisor_inspections_burrows,
+				  last_supervisorInspection ,
+				  npip_inspections,
+				  npip_rodents,
+				  last_pipinspection,
+				  ndays_baited,
+				  nhours_baiting,
+				  ndryice_application,
+				  gispropnum_count)
 
-on SI.omppropid = props.omppropid COLLATE Latin1_general_BIN
+	select l.gispropnum,
+		   l.omppropid,
+		   sum(isnull(r4.ncleaning_visits, 0)) as ncleaning_visits,
+		   sum(isnull(r4.ncleaning_days_visits, 0)) as ncleaning_days_visits,
+		   sum(isnull(r4.ncleaning_hours, 0.0)) as ncleaning_hours,
+		   sum(isnull(r4.npacker_visits, 0)) as npacker_visits,
+		   sum(isnull(r4.npacker_days_visits, 0.0)) as npacker_days_visits,
+		   max(r4.last_dailytaskentry) as last_dailytaskentry,
+		   sum(isnull(r.nsupervisor_inspections, 0)) as nsupervisor_inspections,
+		   sum(isnull(r.nsupervisor_inspections_rodents, 0)) as nsupervisor_inspections_rodents,
+		   sum(isnull(r.nsupervisor_inspections_burrows, 0)) as nsupervisor_inspections_burrows,
+		   max(r.last_supervisorInspection) as last_supervisorInspection,
+		   sum(isnull(r2.npip_inspections, 0)) as npip_inspections,
+		   sum(isnull(r2.npip_rodents, 0)) as npip_rodents,
+		   max(r2.last_pipinspection) as last_pipinspection,
+		   sum(isnull(r3.ndays_baited, 0)) as ndays_baited,
+		   sum(isnull(r3.nhours_baiting, 0.0)) as nhours_baiting,
+		   sum(isnull(r3.ndryice_application, 0)) as ndryice_application,
+		   count(gispropnum)  
+	from @nrrsites as l
+	left join
+		@amps_ins as r
+	on l.omppropid = r.omppropid
+	left join
+		 @pip as r2
+	on l.omppropid = r2.omppropid
+	left join
+		 @amps_rollup as r3
+	on l.omppropid = r3.omppropid
+	left join
+		 @dailytasks as r4
+	on l.omppropid = r4.omppropid
+	group by grouping sets((l.omppropid, l.gispropnum),
+							l.gispropnum)
 
-
-
-LEFT JOIN 
-( -- Query 4 contains PIP inspection information
-SELECT [Prop ID],
-count(distinct cast([Date] as date)) as PIP_inspections,
-sum(CASE WHEN ProbHaz='Rodent holes' THEN 
-		(CASE WHEN isnumeric(Number)=1 THEN Number
-		WHEN Number='10+' THEN 10
-		ELSE 0 END)
-	ELSE 0 END
-	) as Burrows
-FROM 
-DWH.dbo.tbl_PIP_ConditionsHazards
-WHERE cast([Date] as date) BETWEEN @startdate and @enddate
-group by [Prop ID]
-) as PIP
-on PIP.[Prop ID] = props.omppropid
-
-
-LEFT JOIN 
-( -- Query 5 contains AMPS baiting work orders
-
-SELECT PropID
-	  ,count(distinct [Date Worked]) as Days_Baited
-	  ,sum([Labor Hours]) as Baiting_Hours
-	  ,sum(CASE WHEN Comments LIKE '%rat ice%' THEN 1 ELSE 0 END) as rat_ice_applications
-
-FROM (
-SELECT l.evt_code as WorkOrder_ID
-	  ,l.evt_object as 'PropID'
-	  ,q.obj_desc as 'Prop Name'
-	  ,REPLACE(REPLACE(l.evt_desc, CHAR(10), ''), CHAR(13), '') AS 'Description'
-	  ,l.evt_udfchar13 as 'Work Order Status'
-	  ,cast(r.boo_date as date) as 'Date Worked'
-	  ,count(r.boo_acd) as 'Applications'
-	  ,sum(r.boo_hours) as 'Labor Hours'
-	  ,coalesce(l.commentvalues,'') as 'Comments'
-	FROM 
-	(SELECT 
-		R5EVENTS.*,CommentValues
-		
-		FROM EAMPROD.dbo.R5Events as R5EVENTS
-		LEFT JOIN 
-			(/*this subquery concatenates all comments for a given work order. **please update to non-cludgy version when we have 2017 thankssss** */
-			SELECT Details.ADD_CODE,
-			STUFF((
-				SELECT '; ' + replace(replace(cast(ADD_TEXT as nvarchar(100)),char(13),'. '),char(10),'. ')
-				FROM eamprod.dbo.R5ADDETAILS
-				WHERE (ADD_CODE=Details.ADD_CODE)
-				FOR XML PATH(''),TYPE).value('(./text())[1]','VARCHAR(MAX)')
-				,1,2,'') AS CommentValues
-		
-			FROM eamprod.dbo.r5addetails as Details
-			GROUP BY ADD_CODE) as Comments
-		on R5EVENTS.EVT_CODE=Comments.ADD_CODE) as l
-	LEFT JOIN eamprod.dbo.r5bookedhours r
-		ON l.evt_code = r.boo_event 
-	LEFT JOIN eamprod.dbo.r5objects q
-		ON l.evt_object = q.obj_code
-WHERE r.boo_act = 10
-	and l.evt_status not in ('REJ','CANC')
-	and (lower(l.evt_desc) like '% rat %' or lower(l.evt_desc) like '% rats %' or lower(evt_desc) like '%rodent%' or lower(l.evt_desc) like '%bait%' or l.evt_standwork = 'PEST')
-	and (lower(l.evt_desc) not like '%hornet%' and lower(l.evt_desc) not like '%bee%')
-	and cast(r.boo_date as date) BETWEEN @startdate and @enddate
-	and l.evt_class NOT IN ('DAILY', 'FITNESS', 'REC-INSP', 'BP-VIO', 'SIGNS')
-	and l.evt_desc <> 'Adhoc Inspection'
-	and l.evt_mrc <> 'NYC'
-	and l.evt_createdby NOT IN ('R5', 'KYLE.MATTISON', 'JILL.SLATER', 'YEUKCHUNG.NG', 'SCOTT.DAVENPORT', 'PETER.CARLO')
-	and r.boo_hours > 0.0000
-GROUP BY l.evt_code, l.evt_object, q.obj_desc, REPLACE(REPLACE(l.evt_desc, CHAR(10), ''), CHAR(13), ''), cast(l.evt_created as date), cast(l.evt_completed as date),l.evt_udfchar13, r.boo_date, l.commentvalues
-) as a
-GROUP BY PropID
-
-) as WO
-on WO.PropID COLLATE Latin1_General_BIN = props.omppropid
-
-
-left join 
-( -- Query 2 contains Daily Task information
-
- SELECT omppropid as property_number
-	    ,CASE WHEN route_name like '%packer%' THEN 'Packer' ELSE 'Cleaning' END AS Work_Type 
-		,count(date_worked) as Visits
-		,count(DISTINCT date_worked) as Days_Visited
-		,sum(ncrew) as Crew_Size
-		,sum(ncrew*nhours) as Work_Hours
-		,sum(CASE WHEN lower(notes) LIKE '%overflow%' THEN 1 ELSE 0 END) as Overflowing_Cans
-		,sum(CASE WHEN lower(notes) LIKE '%food%' THEN 1 ELSE 0 END) as Food_Waste
-FROM [DWH].[dbo].[tbl_dailytasks]
-WHERE omppropid IN ('B351',	'B555',	'M015-01',	'M048',	'M105-06',	'M144',	'MZ436',	'X008',	'X011',	'X030',	'X030-01',	'X034',	'X047',	'X148B1',	'X148C',	'X148C4',	'X148C6',	'X148D',	'X148E1',	'X148F5',	'X153',	'X225',	'X226',	'X236',	'X254',	'X348',	'B016',	'B016-01',	'B016-02',	'B088',	'B088-02',	'B088-03',	'B139',	'B140',	'B217',	'B237',	'B262',	'B263',	'B266',	'B269',	'B298',	'B317',	'B322',	'B323',	'B334',	'B348',	'B359',	'M015',	'M033',	'M053',	'M065',	'M067',	'M071-04',	'M071-08',	'M071-13',	'M071-16',	'M071-ZN07',	'M071-ZN09',	'M082',	'M088',	'M088-01',	'M088-03',	'M105',	'M105-01',	'M105-02',	'M105-04',	'M105-08',	'M113',	'M116',	'M122',	'M123',	'M124',	'M144-01',	'M144-ZN01',	'M144-ZN02',	'M144-ZN03',	'M144-ZN04',	'M144-ZN05',	'M144-ZN06',	'M165',	'M188',	'M188A',	'M195',	'M196',	'M200',	'M201',	'M220',	'M224',	'M228',	'M229',	'M235',	'M238',	'M241',	'M246',	'M255',	'M259',	'M270',	'M321',	'X001-ZN02',	'X001A-01',	'X006',	'X008-01',	'X008-03',	'X011-ZN01',	'X011-ZN02',	'X017',	'X017-01',	'X017-02',	'X028',	'X030-02',	'X030-99',	'X030-ZN01',	'X030-ZN02',	'X032',	'X034-01',	'X034-06',	'X034-ZN01',	'X034-ZN02',	'X037',	'X042',	'X047-01',	'X047-ZN01',	'X047-ZN02',	'X068',	'X071',	'X085',	'X102',	'X108',	'X114',	'X129',	'X148C5',	'X148C7',	'X148D1',	'X148E',	'X153-01',	'X168',	'X174',	'X219',	'X244',	'X252',	'X257',	'X258',	'X263',	'X274',	'X280',	'X289',	'X291',	'X292',	'X300',	'X302',	'X348-01',	'X348-02',	'B006',	'B023',	'B037',	'B041',	'B045',	'B340',	'B395',	'B429',	'B430',	'M002',	'M004',	'M016',	'M080',	'M247',	'M254',	'X008-ZN01',	'X008-ZN02',	'X008-ZN03',	'X018',	'X030-ZN03',	'X036',	'X058',	'X059',	'X061',	'X069',	'X081',	'X115',	'X153-02',	'X271',	'X001A',	'X057',	'X067',	'X105',	'X130',	'X148B2',	'X148C1',	'X148C3',	'X269',	'XZ475')
-and date_worked BETWEEN @startdate and @enddate
-GROUP BY omppropid, route_name
---ORDER BY property_number, work_type
-
-) as DT
-on DT.property_number = props.omppropid
-
-left join 
-(--query 7 gets the last supervisor inspection
-  SELECT omppropid
-		,max(inspection_date) as last_supervisorInspection
-  FROM [DWH].[dbo].[tbl_supervisorinspections_inspectionresults]
-  WHERE inspection_date < = @enddate
-  and inspection_status = 'Completed'
-  group by omppropid
-) as last_SI
-on last_SI.omppropid = props.OMPPROPID COLLATE Latin1_general_BIN
-
-left join 
-(--query 8 gets last PIP inspection
-SELECT [Prop ID],max(cast([Date] as date)) as last_pipinspection
-FROM DWH.dbo.tbl_PIP_InspectionMain
-where cast([Date] as date) <= @enddate
-group by [Prop ID]
-) as last_PIP
-on last_PIP.[Prop ID] = props.OMPPROPID
-
-left join 
-(--query 6 gets the last Daily Task entry
-
-SELECT omppropid
-	  ,max(date_worked) as last_workentry
-FROM [DWH].[dbo].[tbl_dailytasks]
-WHERE date_worked <= @enddate
-GROUP BY omppropid
-
-) as last_DT
-on last_DT.omppropid = props.OMPPROPID 
-
-
-group by gispropnum,
-props.omppropid,
-signname,
-department,
-[NRR Zone],
-sla,
-supervisor_inspections,
-supervisor_inspections,
-rodent_sightings,
-num_burrows,
-PIP_inspections,
-Burrows,
-last_DT.last_workentry,
-last_SI.last_supervisorinspection,
-last_PIP.last_pipinspection,
-wo.baiting_hours,
-wo.days_baited,
-wo.rat_ice_applications
-
-order by Borough,district,gispropnum,omppropid,sla
-
-GO
+	select *
+	from(
+	select l.borough,
+		   l.nrr_name,
+		   l.district,
+		   l.gispropnum,
+		   l.omppropid,
+		   l.site_name,
+		   l.sla,
+		   r.ncleaning_visits,
+		   r.ncleaning_days_visits,
+		   r.ncleaning_hours,
+		   r.npacker_visits,
+		   r.npacker_days_visits,
+		   r.last_dailytaskentry,
+		   r.nsupervisor_inspections,
+		   r.nsupervisor_inspections_rodents,
+		   r.nsupervisor_inspections_burrows,
+		   r.last_supervisorinspection,
+		   r.npip_inspections,
+		   r.npip_rodents,
+		   r.last_pipinspection,
+		   r.ndays_baited,
+		   r.nhours_baiting,
+		   r.ndryice_application
+	from @nrrsites as l
+	left join
+		 @cube as r
+	on l.omppropid = r.omppropid) as t1
+	union all
+	(select l.borough,
+		   l.nrr_name,
+		   l.district,
+		   l.gispropnum,
+		   cast(null as nvarchar(30)) as omppropid,
+		   l.site_name,
+		   l.sla,
+		   r.ncleaning_visits,
+		   r.ncleaning_days_visits,
+		   r.ncleaning_hours,
+		   r.npacker_visits,
+		   r.npacker_days_visits,
+		   r.last_dailytaskentry,
+		   r.nsupervisor_inspections,                                
+		   r.nsupervisor_inspections_rodents,
+		   r.nsupervisor_inspections_burrows,
+		   r.last_supervisorInspection,
+		   r.npip_inspections,
+		   r.npip_rodents,
+		   r.last_pipinspection,
+		   r.ndays_baited,
+		   r.nhours_baiting,
+		   r.ndryice_application
+	from @nrrsites as l
+	right join
+		 @cube as r
+	on l.gispropnum = r.gispropnum
+	where r.omppropid is null and
+		  l.gispropnum = l.omppropid and
+		  r.gispropnum_count > 1)
+	order by gispropnum, omppropid
+	--order by last_pipinspection desc
+	 
+	 
