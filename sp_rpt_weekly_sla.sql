@@ -21,70 +21,86 @@ use reportdb
 go
 
 create or alter procedure rpt.sp_rpt_weekly_sla @Start date, @End date, @Boro nvarchar(1) as 
-SELECT 
-			cast(a.cal_week_start as date) as week_start, --week starts on Sunday
-			left(a.district,1) as Boro_Code,
-			a.district,
-			a.sla,
-			a.property_number,
-			a.property_name,
-			COALESCE(a.visits,0) as visits,
-			/*SLA progress is the percentage of visits made out of the number necessary to meet the SLA. Currently caps out at 100 but can change to give credit for additional visits */
-			CASE WHEN sla='A' and   a.visits >= 5 THEN 100
-				WHEN sla='A' and  a.visits = 4 THEN 80
-				WHEN sla='A' and  a.visits = 3 THEN 60
-				WHEN sla='A' and  a.visits = 2 THEN 40
-				WHEN sla='A' and  a.visits = 1 THEN 20
-				WHEN sla='B' and  a.visits >= 3 THEN 100
-				WHEN sla='B' and  a.visits = 2 THEN 66
-				WHEN sla='B' and  a.visits = 1 THEN 33
-				WHEN sla='C' and  a.visits >= 1 THEN 100
-			ELSE 0 END as 'SLAProgress',
-			SUM(CAST(b.labormns as float)) as wkly_labor_minutes
-			FROM --includes subquery a, with visit information, and subquery b, with labor hour information.
-				(SELECT
-				calprop.cal_week_start,
-				calprop.district,
-				calprop.property_number,
-				calprop.property_name,
-				calprop.sla,
-				wv.visits
-				FROM --join subquery wv (weekly visits) with subquery calprop (full list of properties and all calendar weeks)
-					(select dateadd(week, datediff(week,0,date_worked),-1) as week_start,
-							omppropid as property_number,
-							count(distinct date_worked) as visits
-					 from [dataparks].dwh.dbo.tbl_dailytasks
-					 group by dateadd(week, datediff(week,0,date_worked),-1), omppropid
-							) as wv
-					RIGHT OUTER JOIN (SELECT DISTINCT(DATEADD(week,datediff(week,0,cal.ref_date),-1)) as cal_week_start,
-							pr.obj_code as property_number,
-							pr.obj_desc as property_name,
-							pr.obj_mrc as district,
-							pr.obj_udfchar02 as sla
-							FROM dwh.dbo.tbl_ref_calendar as cal
-							CROSS JOIN [dataparks].EAMPROD.dbo.r5objects as pr
-							WHERE cal.ref_date BETWEEN @Start and @End AND 
-							pr.OBJ_UDFCHAR02 in ('A','B','C') and pr.OBJ_NOTUSED='-'
-							--order by property_number, cal_week_start
-							) as calprop
-							on calprop.cal_week_start=wv.week_start AND 
-							   calprop.property_number=LTRIM(RTRIM(wv.property_number))COLLATE SQL_Latin1_General_CP1_CI_AS
-					) as a
-					LEFT JOIN
-						(select dateadd(week, datediff(week,0,date_worked),-1) as week_start,
-								omppropid as property_number,
-								daily_task__id,
-								sum(ncrew) as allcrew,
-								sum(napsw + ncpw + ncsa + npop) as paidcrew,
-								cast(round(sum(nhours * 60), 0) as int) as mns,
-								cast(round(sum(nhours * 60), 0) as int) * sum(napsw + ncpw + ncsa + npop) as labormns
-						 from [dataparks].dwh.dbo.tbl_dailytasks
-						 where lower(activity) = 'work' and
-							   date_worked between @Start and @End
-						 group by dateadd(week, datediff(week,0,date_worked),-1), omppropid, daily_task__id) as b
-					on a.cal_week_start=b.week_start AND 
-					   a.property_number=LTRIM(RTRIM(b.property_number))COLLATE SQL_Latin1_General_CP1_CI_AS
-			WHERE left(district,1) = @Boro 
-			GROUP BY a.cal_week_start, a.property_number, a.property_name, sla, district, a.visits 
-			--HAVING a.sla  in('A','B','C') 
-			ORDER BY visits, district,sla,property_number,cal_week_start
+--declare @Start date ='2020-06-28', @End date = '2020-07-04', @Boro nvarchar(1) = 'Q';
+
+if object_id('tempdb..#ref_calndr') is not null
+	drop table #ref_calndr
+
+/*Create a calendar reference table that contains all the dates in the selected time period and the number of days in the week.*/
+select ref_date,
+	   /*Find the minimum date of the week selected (this will always be Sunday)*/
+	   min(ref_date) over(partition by calndr_week, calndr_year order by calndr_week, calndr_year) as week_start,
+	   /*Count the number of days in the given week, particularly if a partial week is chosen.*/
+	   count(*) over(partition by calndr_week, calndr_year order by calndr_week, calndr_year) as week_days
+into #ref_calndr
+from [dataparks].dwh.dbo.tbl_ref_calendar
+where ref_date between @Start and @End
+
+if object_id('tempdb..#ref_date_units') is not null
+	drop table #ref_date_units
+
+select distinct r.borough,
+	   r.district,
+	   r.unit_id,
+	   r2.unit_desc,
+	   r.sla_id,
+	   /*Multiply these values by 1.0 to make them floats*/
+	   r.sla_min_days * 1. as sla_min_days,
+	   r.sla_max_days * 1. as sla_max_days,
+	   l.week_start,
+	   l.week_days
+into #ref_date_units
+from #ref_calndr as l
+full outer join
+/*Find all historic SLAs where the selected dates fall between the effective start and effective end dates.*/
+	 (select *
+	  from sladb.dbo.vw_sla_historic
+	  where (@Start between effective_start_adj and effective_end_adj or
+			 @End between effective_start_adj and effective_end_adj or
+			 effective_start_adj between @Start and @End or
+			 effective_end_adj between @Start and @End) and
+			borough = @Boro) as r
+on l.ref_date between effective_start_adj and effective_end_adj
+left join
+	 sladb.dbo.tbl_ref_unit as r2
+on r.unit_id = r2.unit_id
+
+if object_id('tempdb..#unit_visits') is not null
+	 drop table #unit_visits
+
+select l.unit_id,
+	   sum(l.visits) as visits,
+	   r.week_start
+into #unit_visits
+from (select omppropid as unit_id,
+			 date_worked as ref_date,
+			 count(distinct date_worked) * 1. as visits
+	  from [dataparks].dwh.dbo.tbl_dailytasks
+	  where date_worked between @Start and @End and
+			lower(activity) = 'work' /*and
+			/*This doesn't work because fixed post sites don't have sectors.*/
+			left(sector, 1) = @Boro*/
+	  group by omppropid, date_worked) as l
+left join
+	 #ref_calndr as r
+on l.ref_date = r.ref_date
+group by l.unit_id, r.week_start
+
+select l.week_start,
+	   l.borough as Boro_Code,
+	   l.district, 
+	   l.sla_id as sla,
+	   l.unit_id as property_number,
+	   l.unit_desc as property_name,
+	   coalesce(r.visits, 0.0) as visits,
+	   case when r.visits/l.sla_min_days > 1 then 100.
+			else coalesce(r.visits, 0.0)/l.sla_min_days * 100 
+	   end as SLAProgress
+from #ref_date_units as l
+left join
+	 #unit_visits as r
+on l.week_start = r.week_start and
+   l.unit_id = r.unit_id
+where l.unit_id is not null and 
+	  l.sla_id != 'N' and l.sla_id is not null
+order by district, sla, week_start, property_number
